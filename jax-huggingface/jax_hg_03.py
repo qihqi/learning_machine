@@ -52,15 +52,24 @@ register_pytree_node(
 )
 
 def _flatten_static_cache(cache):
+  layers_keys = [layer.keys for layer in cache.layers]
+  layers_values = [layer.values for layer in cache.layers]
+
   return (
-      cache.key_cache,
-      cache.value_cache,
+      layers_keys,
+      layers_values,
   ), (cache._config, cache.max_batch_size, cache.max_cache_len)
 
 def _unflatten_static_cache(aux, children):
-  cache = cache_utils.StaticCache(*aux)
-  cache._config = aux[0]
-  cache.key_cache, cache.value_cache = children
+  _config, max_batch_size, max_cache_len = aux
+  cache = cache_utils.StaticCache(config=_config, max_batch_size=max_batch_size, max_cache_len=max_cache_len, )
+  cache._config = _config
+  layers_keys, layers_values = children
+  for i, layer in enumerate(cache.layers):
+    layer.keys = layers_keys[i]
+    layer.values = layers_values[i]
+    layer.max_batch_size, layer.num_heads, _, layer.head_dim = layers_keys[i].shape
+
   return cache
 
 register_pytree_node(
@@ -175,11 +184,14 @@ def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
 
   batch_size, seq_length = input_ids.shape
   model_weights = model.state_dict()
+  
+  max_cache_len = seq_length + max_tokens
+
   with torch.no_grad():
     start = time.perf_counter()
     past_key_values = StaticCache(
         config=model.config, 
-        max_batch_size=1, max_cache_len=max_tokens, 
+        max_batch_size=1, max_cache_len=max_cache_len, 
         device='jax', dtype=model.dtype
     )
     past_key_values._config = model.config # keep this
@@ -196,22 +208,21 @@ def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
     next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]
     generated_ids.append(next_token[:, 0].item())
 
-    for k in past_key_values.key_cache:
-      k.apply_jax_(jax.device_put, NamedSharding(mesh, P(None, 'axis', None, None))) # shard on num of head
-    for k in past_key_values.value_cache:
-      k.apply_jax_(jax.device_put, NamedSharding(mesh, P(None, 'axis', None, None))) # shard on num of head
-
-
-    cache_position = torch.tensor([seq_length + 1], device='jax')
+    for layer in past_key_values.layers:
+      sharding_spec = P(None, 'axis', None, None)
+      layer.keys = layer.keys.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
+      layer.values = layer.values.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
     
-    for i in range(1, max_tokens):
+    cache_position = torch.tensor([seq_length], device='jax')
+    
+    for i in range(0, max_tokens):
         iter_time = time.perf_counter()
         next_token, past_key_values = jitted(
           model_weights,
           next_token.clone(), None, cache_position, past_key_values)
         generated_ids.append(next_token.int().item())
         cache_position += 1
-        #print('Iteration', i, ' took ', time.perf_counter() - iter_time)
+        print('Iteration', i+1, ' took ', time.perf_counter() - iter_time)
     end = time.perf_counter()
 
   text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
