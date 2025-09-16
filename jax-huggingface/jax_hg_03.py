@@ -161,7 +161,7 @@ def autoregressive_decode(model, input_ids, tokenizer, max_tokens=50, use_static
   return result_tokens
 
 # https://huggingface.co/docs/transformers/v4.44.0/en/llm_optims?static-kv=advanced+usage%3A+control+Static+Cache#static-kv-cache-and-torchcompile
-def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
+def autoregressive_decode_static(model, input_ids, tokenizer, attention_mask, max_tokens=50):
 
   def decode_one_tokens(model_weights, cur_token, input_pos, cache_position, past_key_values):
     logits, cache = torch.func.functional_call(
@@ -178,37 +178,52 @@ def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
     new_token = torch.argmax(logits[:, -1], dim=-1)[:, None]
     return new_token, cache
 
+  def prefill_fn(model_weights, input_ids, attention_mask, cache_position, past_key_values):
+      return torch.func.functional_call(
+          model,
+          model_weights,
+          (input_ids,),
+          dict(
+              attention_mask=attention_mask,
+              cache_position=cache_position,
+              past_key_values=past_key_values,
+              return_dict=False,
+              use_cache=True,
+          ),
+      )
+
   jitted = tx.interop.jax_jit(decode_one_tokens)
+  prefill_jitted = tx.interop.jax_jit(prefill_fn)
   #jitted = decode_one_tokens
 
   batch_size, seq_length = input_ids.shape
   model_weights = model.state_dict()
+  
+  max_cache_len = seq_length + max_tokens
+
   with torch.no_grad():
     start = time.perf_counter()
+    max_batch_size = 1
     past_key_values = StaticCache(
         config=model.config, 
-        max_batch_size=1, max_cache_len=max_tokens, 
+        max_batch_size=max_batch_size, max_cache_len=max_cache_len, 
         device='jax', dtype=model.dtype
     )
+
     past_key_values._config = model.config # keep this
     cache_position = torch.arange(seq_length, device='jax')
-    generated_ids = []
-
-    logits, past_key_values = model(
-        input_ids, 
+    generated_ids = torch.zeros((batch_size, max_tokens), dtype=torch.long, device='jax')
+    
+    logits, past_key_values = prefill_jitted(
+        model_weights=model_weights,
+        input_ids=input_ids, 
         cache_position=cache_position, 
+        attention_mask=attention_mask,
         past_key_values=past_key_values, 
-        return_dict=False, 
-        use_cache=True
     )
-    next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]
-    generated_ids.append(next_token[:, 0].item())
-
-    for k in past_key_values.key_cache:
-      k.apply_jax_(jax.device_put, NamedSharding(mesh, P(None, 'axis', None, None))) # shard on num of head
-    for k in past_key_values.value_cache:
-      k.apply_jax_(jax.device_put, NamedSharding(mesh, P(None, 'axis', None, None))) # shard on num of head
-
+  
+    next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]  
+    generated_ids[:, 0] = next_token.squeeze(-1)
 
     for layer in past_key_values.layers:
       sharding_spec = P(None, 'axis', None, None)
@@ -222,9 +237,10 @@ def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
         next_token, past_key_values = jitted(
           model_weights,
           next_token.clone(), None, cache_position, past_key_values)
-        generated_ids.append(next_token.int().item())
+        generated_ids[:, i] = next_token.squeeze(-1)
         cache_position += 1
-        #print('Iteration', i, ' took ', time.perf_counter() - iter_time)
+        
+        print('Iteration', i, ' took ', time.perf_counter() - iter_time)
     end = time.perf_counter()
 
   text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
@@ -242,12 +258,18 @@ with env:
   input_ids = model_inputs.input_ids.to('jax').apply_jax_(
     jax.device_put,
     NamedSharding(mesh, P()))
-  tx.interop.call_jax(jax.block_until_ready, weights)
+  
+  attention_mask = model_inputs.attention_mask.to('jax').apply_jax_(
+      jax.device_put,
+      NamedSharding(mesh, P())
+  )
+
+  tx.interop.call_jax(jax.block_until_ready, (weights, input_ids, attention_mask))
 
   #run_twice_and_print_cache(model, input_ids)
   #run_twice_and_print_cache_static(model, input_ids)
 
-  autoregressive_decode_static(model, input_ids, tokenizer)
+  autoregressive_decode_static(model, input_ids, tokenizer, attention_mask)
 
 
 sys.exit(0)
