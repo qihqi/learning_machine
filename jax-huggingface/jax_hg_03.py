@@ -52,15 +52,23 @@ register_pytree_node(
 )
 
 def _flatten_static_cache(cache):
+  layers_keys = [layer.keys for layer in cache.layers]
+  layers_values = [layer.values for layer in cache.layers]
+
   return (
-      cache.key_cache,
-      cache.value_cache,
-  ), (cache._config, cache.max_batch_size, cache.max_cache_len)
+      layers_keys,
+      layers_values,
+  ), (cache._config, cache.max_cache_len)
 
 def _unflatten_static_cache(aux, children):
-  cache = cache_utils.StaticCache(*aux)
-  cache._config = aux[0]
-  cache.key_cache, cache.value_cache = children
+  _config, max_cache_len = aux
+  cache = cache_utils.StaticCache(config=_config, max_cache_len=max_cache_len, )
+  cache._config = _config
+  layers_keys, layers_values = children
+  for i, layer in enumerate(cache.layers):
+    layer.keys = layers_keys[i]
+    layer.values = layers_values[i]
+
   return cache
 
 register_pytree_node(
@@ -202,6 +210,11 @@ def autoregressive_decode_static(model, input_ids, tokenizer, max_tokens=50):
       k.apply_jax_(jax.device_put, NamedSharding(mesh, P(None, 'axis', None, None))) # shard on num of head
 
 
+    for layer in past_key_values.layers:
+      sharding_spec = P(None, 'axis', None, None)
+      layer.keys = layer.keys.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
+      layer.values = layer.values.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
+    
     cache_position = torch.tensor([seq_length + 1], device='jax')
     
     for i in range(1, max_tokens):
