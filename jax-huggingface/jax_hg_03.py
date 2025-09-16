@@ -79,7 +79,7 @@ register_pytree_node(
 
 model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-2-7b-hf", 
-        torch_dtype="bfloat16", device_map="cpu")
+        dtype="bfloat16", device_map="cpu")
         
 def shard_weights_llama(mesh, weights):
   result = {}
