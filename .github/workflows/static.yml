@@ -41,12 +41,12 @@ jobs:
         run: |
           cd docs
           pip install mkdocs
-          mkocs build
+          mkdocs build
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           # Upload entire repository
-          path: './docs/site'
+          path: "./docs/site"
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
